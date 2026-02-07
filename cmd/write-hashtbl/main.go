@@ -23,7 +23,11 @@ import (
 )
 
 func main() {
-	fmt.Println("write-hashtbl version: v1.0.6-logslots-fixed")
+	fmt.Println("write-hashtbl version: collision-fixed-v1.5")
+	fmt.Println("")
+	fmt.Println("This took way longer than I was hoping for")
+	fmt.Println("My node was down for 2 days while i was working on this")
+	fmt.Println("but is was worth it, and I added some cool new features!")
 
 	ok, err := clingy.Environment{
 		Name: "write-hashtbl",
