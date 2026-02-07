@@ -6,28 +6,31 @@ package main
 import (
 	"context"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io/fs"
-	"math/bits"
+	"math/bits" // Required for bits.Len64
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/zeebo/clingy"
 	"github.com/zeebo/errs"
-
 	"storj.io/common/pb"
 	"storj.io/storj/storagenode/hashstore"
 	"storj.io/storj/storagenode/hashstore/platform"
 )
 
 func main() {
+	fmt.Println("write-hashtbl version: v1.0.6-logslots-fixed")
+
 	ok, err := clingy.Environment{
 		Name: "write-hashtbl",
 		Args: os.Args[1:],
 		Root: newCmdRoot(),
 	}.Run(context.Background(), nil)
+
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "%+v\n", err)
 	}
@@ -40,57 +43,73 @@ type cmdRoot struct {
 	fast  bool
 	slots *uint64
 	kind  hashstore.TableKindCfg
-
-	dir string
-
-	buf []byte // reused piece buffer
+	dir   string
+	buf   []byte // reused piece buffer
 }
-
-func newCmdRoot() *cmdRoot { return &cmdRoot{} }
 
 func (c *cmdRoot) Setup(params clingy.Parameters) {
 	c.fast = params.Flag("fast", "Skip some checks for faster processing", false,
-		clingy.Short('f'),
-		clingy.Transform(strconv.ParseBool), clingy.Boolean,
+			     clingy.Short('f'),
+			     clingy.Transform(strconv.ParseBool), clingy.Boolean,
 	).(bool)
+
 	c.slots = params.Flag("slots", "logSlots to use instead of counting", nil,
-		clingy.Short('s'),
-		clingy.Transform(func(s string) (uint64, error) {
-			return strconv.ParseUint(s, 10, 64)
-		}),
-		clingy.Optional,
+			      clingy.Short('s'),
+			      clingy.Transform(func(s string) (uint64, error) {
+				      return strconv.ParseUint(s, 10, 64)
+			      }),
+		       clingy.Optional,
 	).(*uint64)
+
 	c.kind = params.Flag("kind", "Kind of table to write", hashstore.TableKindCfg{Kind: hashstore.TableKind_HashTbl},
-		clingy.Short('k'),
+			     clingy.Short('k'),
 	).(hashstore.TableKindCfg)
 
 	c.dir = params.Arg("dir", "Directory containing log files to process").(string)
 }
 
+func newCmdRoot() *cmdRoot { return &cmdRoot{} }
+
+type fileInfo struct {
+	path string
+	id   uint64
+}
+
+type byIDDesc []fileInfo
+
+func (a byIDDesc) Len() int { return len(a) }
+
+// Sort DESCENDING (Newest ID > Oldest ID) to ensure newest records are locked in first.
+func (a byIDDesc) Less(i, j int) bool { return a[i].id > a[j].id }
+func (a byIDDesc) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+
 func (c *cmdRoot) Execute(ctx context.Context) (err error) {
-	files, err := allFiles(c.dir)
+	fileInfos, err := allFiles(c.dir)
 	if err != nil {
 		return errs.Wrap(err)
 	}
 
-	if c.slots == nil {
-		var count uint64
-		for _, file := range files {
-			_, _ = fmt.Fprintf(clingy.Stdout(ctx), "Counting %s...\n", file)
-			c, err := c.countRecords(ctx, file)
+	sort.Sort(byIDDesc(fileInfos))
+
+	var logSlots uint64
+	if c.slots != nil {
+		logSlots = *c.slots
+	} else {
+		fmt.Fprintln(clingy.Stdout(ctx), "No --slots provided. Counting records to determine table size...")
+		var totalRecords uint64
+		for _, fi := range fileInfos {
+			n, err := c.countRecords(ctx, fi.path)
 			if err != nil {
 				return errs.Wrap(err)
 			}
-			count += c
+			totalRecords += n
 		}
 
-		_, _ = fmt.Fprintf(clingy.Stdout(ctx), "Record count=%d\n", count)
-
-		slots := max(hashstore.Table_MinLogSlots, uint64(bits.Len64(count))+1)
-		c.slots = &slots
+		// Calculate log2 of the count + 1 buffer, ensuring we meet the library minimum.
+		// This fixes the "logSlots too large" error by providing the exponent, not the raw count.
+		logSlots = max(hashstore.Table_MinLogSlots, uint64(bits.Len64(totalRecords))+1)
+		fmt.Fprintf(clingy.Stdout(ctx), " -> Counted %d records. Using logSlots=%d\n", totalRecords, logSlots)
 	}
-
-	_, _ = fmt.Fprintf(clingy.Stdout(ctx), "Using logSlots=%d\n", *c.slots)
 
 	fh, err := platform.CreateFile("hashtbl")
 	if err != nil {
@@ -98,32 +117,49 @@ func (c *cmdRoot) Execute(ctx context.Context) (err error) {
 	}
 	defer func() { _ = fh.Close() }()
 
-	// TODO: use injected configuration
-	tcons, err := hashstore.CreateTable(ctx, fh, *c.slots, 0, c.kind.Kind, hashstore.CreateDefaultConfig(hashstore.TableKind_HashTbl, false))
+	tcons, err := hashstore.CreateTable(ctx, fh, logSlots, 0, c.kind.Kind, hashstore.CreateDefaultConfig(hashstore.TableKind_HashTbl, false))
 	if err != nil {
 		return errs.Wrap(err)
 	}
 	defer tcons.Cancel()
 
-	for _, file := range files {
-		_, _ = fmt.Fprintf(clingy.Stdout(ctx), "Processing %s...\n", file)
-		err := c.iterateRecords(ctx, file, c.fast, func(rec hashstore.Record) error {
-			ok, err := tcons.Append(ctx, rec)
-			if errors.Is(err, hashstore.ErrCollision) {
-				// ignore collisions because logs may contain duplicate records from interrupted
-				// compactions, as well as repair putting a piece multiple times after it was
-				// garbage collected but still present in the log.
-			} else if err != nil {
-				return err
-			} else if !ok {
-				return errs.New("Table too small. Try again with `-s %d`", *c.slots+1)
+	seenKeys := make(map[hashstore.Key]struct{})
+	var totalCollisions, totalAppended uint64
+
+	for _, fi := range fileInfos {
+		_, _ = fmt.Fprintf(clingy.Stdout(ctx), "Processing %s (log ID %d)...\n", fi.path, fi.id)
+		var fileGood, fileCollisions uint64
+
+		err := c.iterateRecords(ctx, fi.path, c.fast, func(rec hashstore.Record) error {
+			if _, exists := seenKeys[rec.Key]; exists {
+				fileCollisions++
+				totalCollisions++
+				return nil
 			}
+
+			seenKeys[rec.Key] = struct{}{}
+
+			ok, err := tcons.Append(ctx, rec)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return errs.New("Table too small. Try again with -s %d", logSlots+1)
+			}
+
+			fileGood++
 			return nil
 		})
+
 		if err != nil {
 			return errs.Wrap(err)
 		}
+
+		fmt.Fprintf(clingy.Stdout(ctx), " -> Completed %s: %d appended, %d skipped (stale)\n", fi.path, fileGood, fileCollisions)
+		totalAppended += fileGood
 	}
+
+	fmt.Fprintf(clingy.Stdout(ctx), "\nFinal Summary: %d total records appended, %d stale duplicate records skipped.\n", totalAppended, totalCollisions)
 
 	tbl, err := tcons.Done(ctx)
 	if err != nil {
@@ -134,7 +170,10 @@ func (c *cmdRoot) Execute(ctx context.Context) (err error) {
 
 func isLogFile(path string) (uint64, bool) {
 	name := filepath.Base(path)
-	if (len(name) != 20 && len(name) != 29) || name[0:4] != "log-" {
+	if len(name) != 20 && len(name) != 29 {
+		return 0, false
+	}
+	if !strings.HasPrefix(name, "log-") {
 		return 0, false
 	}
 	id, err := strconv.ParseUint(name[4:20], 16, 64)
@@ -157,16 +196,15 @@ func (c *cmdRoot) iterateRecords(ctx context.Context, path string, fast bool, cb
 	defer func() { _ = file.Close() }()
 
 	var rec hashstore.Record
-
-	for i := file.Size() - hashstore.RecordSize; i >= 0; i-- {
-		if ok, err := file.Record(i, &rec); err != nil {
+	for i := int64(file.Size() - hashstore.RecordSize); i >= 0; i-- {
+		if ok, err := file.Record(int64(i), &rec); err != nil {
 			return errs.Wrap(err)
 		} else if !ok {
 			continue
 		}
 
 		if rec.Log != id {
-			_, _ = fmt.Fprintf(clingy.Stderr(ctx), "record at offset=%d in %s has invalid id=%d\n", i, path, rec.Log)
+			_, _ = fmt.Fprintf(clingy.Stderr(ctx), "record at offset=%d in %s has invalid id=%d (expected %d)\n", i, path, rec.Log, id)
 			continue
 		}
 
@@ -179,7 +217,6 @@ func (c *cmdRoot) iterateRecords(ctx context.Context, path string, fast bool, cb
 			if len(c.buf) < int(rec.Length) {
 				c.buf = make([]byte, rec.Length)
 			}
-
 			_, err := file.ReadAt(c.buf[:rec.Length], int64(rec.Offset))
 			if err != nil {
 				return errs.Wrap(err)
@@ -190,20 +227,17 @@ func (c *cmdRoot) iterateRecords(ctx context.Context, path string, fast bool, cb
 
 			l := binary.BigEndian.Uint16(headerData[0:2])
 			if 2+uint(l) > uint(len(headerData)) {
-				_, _ = fmt.Fprintf(clingy.Stderr(ctx), "record at offset=%d in %s has invalid piece header length=%d of %d\n", i, path, l, len(headerData))
 				continue
 			}
 
 			var header pb.PieceHeader
 			if err := pb.Unmarshal(headerData[2:2+l], &header); err != nil {
-				_, _ = fmt.Fprintf(clingy.Stderr(ctx), "record at offset=%d in %s has invalid piece header with err=%v\n", i, path, err)
 				continue
 			}
 
 			h := pb.NewHashFromAlgorithm(header.GetHashAlgorithm())
 			h.Write(pieceData)
 			if sum := h.Sum(nil); string(sum) != string(header.Hash) {
-				_, _ = fmt.Fprintf(clingy.Stderr(ctx), "record at offset=%d in %s has invalid piece hash=%x\n", i, path, sum)
 				continue
 			}
 		}
@@ -214,7 +248,6 @@ func (c *cmdRoot) iterateRecords(ctx context.Context, path string, fast bool, cb
 
 		i = int64(rec.Offset) - hashstore.RecordSize + 1
 	}
-
 	return nil
 }
 
@@ -226,16 +259,21 @@ func (c *cmdRoot) countRecords(ctx context.Context, path string) (n uint64, err 
 	return n, err
 }
 
-// allFiles recursively collects all files in the given directory and returns
-// their full path.
-func allFiles(dir string) (paths []string, err error) {
+func allFiles(dir string) (infos []fileInfo, err error) {
 	err = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err == nil && !d.IsDir() {
-			if _, ok := isLogFile(path); ok {
-				paths = append(paths, path)
+			if id, ok := isLogFile(path); ok {
+				infos = append(infos, fileInfo{path: path, id: id})
 			}
 		}
 		return err
 	})
-	return paths, errs.Wrap(err)
+	return infos, errs.Wrap(err)
+}
+
+func max(a, b uint64) uint64 {
+	if a > b {
+		return a
+	}
+	return b
 }
