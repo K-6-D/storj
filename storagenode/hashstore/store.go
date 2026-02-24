@@ -20,6 +20,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"golang.org/x/sys/unix"
 
 	"github.com/spacemonkeygo/monkit/v3"
 	"github.com/zeebo/errs"
@@ -85,6 +86,7 @@ type Store struct {
 		logsMatched    int // number of log files checked and matched
 		logsMismatched int // number of log files checked and mismatched
 	}
+	compacting atomic.Bool // true during compaction to use sequential hints
 
 	rmu sync.RWMutex                // protects consistency of lfs and tbl
 	lfs atomicMap[uint64, *logFile] // all log files
@@ -105,7 +107,7 @@ func NewStore(
 	tablePath string,
 	log *zap.Logger,
 	valid func(Key, []byte) bool,
-	amnesty func(context.Context, []Key),
+	      amnesty func(context.Context, []Key),
 ) (_ *Store, err error) {
 	defer mon.Task()(&ctx)(&err)
 
@@ -183,10 +185,10 @@ func NewStore(
 	// parse the hint file to get an excluder that tells us which log files are ok to skip.
 	excluder := parseHintFile(maxHintPath)
 	s.log.Info("loaded hint file",
-		zap.String("path", maxHintPath),
-		zap.Uint64s("writable", maps.Keys(excluder.writable)),
-		zap.Uint64("largest", excluder.largest),
-		zap.Bool("skip", s.cfg.Store.SkipLogCheck),
+		   zap.String("path", maxHintPath),
+		   zap.Uint64s("writable", maps.Keys(excluder.writable)),
+		   zap.Uint64("largest", excluder.largest),
+		   zap.Bool("skip", s.cfg.Store.SkipLogCheck),
 	)
 
 	// get the name and path of the largest hashtbl file.
@@ -315,10 +317,10 @@ func NewStore(
 			if tableTail := tails[lf.id]; !RecordTailsEqualish(tableTail, logTail) {
 				s.stats.logsMismatched++
 				s.log.Warn("mismatched log tail",
-					zap.Uint64("id", lf.id),
-					zap.String("path", lf.path),
-					zap.Any("table", tableTail),
-					zap.Any("log", logTail),
+					   zap.Uint64("id", lf.id),
+					   zap.String("path", lf.path),
+					   zap.Any("table", tableTail),
+					   zap.Any("log", logTail),
 				)
 
 				invalid, err := s.reconcileLog(ctx, lf.id, lf)
@@ -326,17 +328,17 @@ func NewStore(
 					return Error.Wrap(err)
 				} else if len(invalid) > 0 {
 					s.log.Warn("reconciled log with invalid records",
-						zap.Uint64("id", lf.id),
-						zap.String("path", lf.path),
-						zap.Int("invalid_count", len(invalid)),
+						   zap.Uint64("id", lf.id),
+						   zap.String("path", lf.path),
+						   zap.Int("invalid_count", len(invalid)),
 					)
 					s.amnesty(ctx, invalid)
 				}
 			} else {
 				s.stats.logsMatched++
 				s.log.Debug("matched log tail",
-					zap.Uint64("id", lf.id),
-					zap.String("path", lf.path),
+					    zap.Uint64("id", lf.id),
+					    zap.String("path", lf.path),
 				)
 			}
 
@@ -366,9 +368,9 @@ func NewStore(
 	for id, tail := range tails {
 		s.stats.logsMismatched++
 		s.log.Warn("mismatched log tail",
-			zap.Uint64("id", id),
-			zap.String("path", "<missing>"),
-			zap.Any("table", tail),
+			   zap.Uint64("id", id),
+			   zap.String("path", "<missing>"),
+			   zap.Any("table", tail),
 		)
 
 		invalid, err := s.reconcileLog(ctx, id, nil)
@@ -376,9 +378,9 @@ func NewStore(
 			return nil, Error.Wrap(err)
 		} else if len(invalid) > 0 {
 			s.log.Warn("reconciled log with invalid records",
-				zap.Uint64("id", id),
-				zap.String("path", "<missing>"),
-				zap.Int("invalid_count", len(invalid)),
+				   zap.Uint64("id", id),
+				   zap.String("path", "<missing>"),
+				   zap.Int("invalid_count", len(invalid)),
 			)
 			s.amnesty(ctx, invalid)
 		}
@@ -685,6 +687,19 @@ func (s *Store) readerForRecord(ctx context.Context, rec Record) (_ *Reader, err
 		return nil, Error.New("unable to open log file=%q: %w", lf.path, err)
 	}
 
+	fd := int(fh.Fd())
+	if fd > 0 {  // Valid fd (skip if invalid)
+		off := int64(rec.Offset)
+		len := int64(rec.Length)
+		var advice int
+		if s.compacting.Load() {
+			advice = unix.FADV_SEQUENTIAL  // Encourage readahead for compaction (full/ordered scans)
+		} else {
+			advice = unix.FADV_RANDOM  // Disable readahead for small client reads
+		}
+		_ = unix.Fadvise(fd, off, len, advice)  // Ignore error; it's just a hint
+	}
+
 	return newLogReader(s, lf.path, fh, rec), nil
 }
 
@@ -753,7 +768,7 @@ func (s *Store) reviveRecord(ctx context.Context, fh *os.File, rec Record) (err 
 func (s *Store) Compact(
 	ctx context.Context,
 	shouldTrash func(ctx context.Context, key Key, created time.Time) bool,
-	lastRestore time.Time,
+			lastRestore time.Time,
 ) (err error) {
 	defer mon.Task()(&ctx)(&err)
 	defer s.stats.compactions.Add(1) // increase the number of compactions that have finished
@@ -772,9 +787,9 @@ func (s *Store) Compact(
 		span.Annotate("table_size", fmt.Sprintf("%d", stats.Table.TableSize))
 		span.Annotate("compaction_rounds", fmt.Sprintf("%d", compactionRounds))
 		s.log.Info("finished compaction",
-			zap.Duration("duration", time.Since(start)),
-			zap.Error(err),
-			zap.Any("stats", s.Stats()),
+			   zap.Duration("duration", time.Since(start)),
+			   zap.Error(err),
+			   zap.Any("stats", s.Stats()),
 		)
 	}()
 
@@ -793,7 +808,7 @@ func (s *Store) Compact(
 	// log that we acquired the locks only if it took a while.
 	if dur := time.Since(start); dur > time.Second {
 		s.log.Info("compaction acquired locks",
-			zap.Duration("duration", dur),
+			   zap.Duration("duration", dur),
 		)
 	}
 
@@ -804,9 +819,9 @@ func (s *Store) Compact(
 	defer cancel()
 	go func() {
 		select {
-		case <-ctx.Done():
-		case <-s.closed.Signal():
-			cancel()
+			case <-ctx.Done():
+			case <-s.closed.Signal():
+				cancel()
 		}
 	}()
 
@@ -867,18 +882,20 @@ func (s *Store) compactOnce(
 	ctx context.Context,
 	today uint32,
 	expired func(e Expiration) bool,
-	restored func(e Expiration) bool,
-	shouldTrash func(ctx context.Context, key Key, created time.Time) bool,
+			    restored func(e Expiration) bool,
+			    shouldTrash func(ctx context.Context, key Key, created time.Time) bool,
 ) (completed bool, err error) {
 	defer mon.Task()(&ctx)(&err)
+	defer func() { s.compacting.Store(false) }()
+	s.compacting.Store(true)
 
 	start := time.Now()
 	s.log.Info("compact once started", zap.Uint32("today", today))
 	defer func() {
 		s.log.Info("compact once finished",
-			zap.Duration("duration", time.Since(start)),
-			zap.Bool("completed", completed),
-			zap.Error(err),
+			   zap.Duration("duration", time.Since(start)),
+			   zap.Bool("completed", completed),
+			   zap.Error(err),
 		)
 	}()
 
@@ -985,9 +1002,9 @@ func (s *Store) compactOnce(
 		})
 		if maxLog != nil {
 			s.log.Info("including log due to no rewrite candidates",
-				zap.Uint64("id", maxLog.id),
-				zap.String("path", maxLog.fh.Name()),
-				zapHumanBytes("dead", maxDead),
+				   zap.Uint64("id", maxLog.id),
+				   zap.String("path", maxLog.fh.Name()),
+				   zapHumanBytes("dead", maxDead),
 			)
 			rewriteCandidates[maxLog.id] = true
 		}
@@ -1033,15 +1050,15 @@ func (s *Store) compactOnce(
 
 		ce.Write(
 			zap.Uint64("nset", nset),
-			zap.Uint64("nexist", nexist),
-			zap.Bool("modifications", modifications),
-			zap.Uint64("curr_log_slots", s.tbl.LogSlots()),
-			zapHumanBytes("curr logSlots size", hashtblSize(s.tbl.LogSlots())),
-			zap.Uint64("next_log_slots", logSlots),
-			zapHumanBytes("next logSlots size", hashtblSize(logSlots)),
-			zap.Uint64s("candidates", rewriteCandidatesByDead),
-			zap.Uint64s("rewrite", rewriteSorted),
-			zap.Duration("duration", time.Since(start)),
+			 zap.Uint64("nexist", nexist),
+			 zap.Bool("modifications", modifications),
+			 zap.Uint64("curr_log_slots", s.tbl.LogSlots()),
+			 zapHumanBytes("curr logSlots size", hashtblSize(s.tbl.LogSlots())),
+			 zap.Uint64("next_log_slots", logSlots),
+			 zapHumanBytes("next logSlots size", hashtblSize(logSlots)),
+			 zap.Uint64s("candidates", rewriteCandidatesByDead),
+			 zap.Uint64s("rewrite", rewriteSorted),
+			 zap.Duration("duration", time.Since(start)),
 		)
 	}
 	span := monkit.SpanFromCtx(ctx)
@@ -1060,313 +1077,324 @@ func (s *Store) compactOnce(
 		logSlots == s.tbl.LogSlots() &&
 		s.tbl.Header().Kind == s.cfg.TableDefaultKind.Kind {
 
-		// write out a new hint file to ensure that future restarts are fast even if we didn't do
-		// any compaction.
-		s.writeHintFile()
+			// write out a new hint file to ensure that future restarts are fast even if we didn't do
+			// any compaction.
+			s.writeHintFile()
 
-		return true, nil
-	}
+			return true, nil
+		}
 
-	// increment the number of log files we're attempting to rewrite.
-	s.stats.logsRewritten.Add(uint64(len(rewrite)))
+		// increment the number of log files we're attempting to rewrite.
+		s.stats.logsRewritten.Add(uint64(len(rewrite)))
 
-	// create a new hash table sized for the number of records.
-	af, err := newAtomicFile(filepath.Join(s.tablePath, createHashtblName(s.maxTbl.Add(1))))
-	if err != nil {
-		return false, Error.Wrap(err)
-	}
-	defer af.Cancel()
+		// create a new hash table sized for the number of records.
+		af, err := newAtomicFile(filepath.Join(s.tablePath, createHashtblName(s.maxTbl.Add(1))))
+		if err != nil {
+			return false, Error.Wrap(err)
+		}
+		defer af.Cancel()
 
-	cons, err := CreateTable(ctx, af.File, logSlots, today, s.cfg.TableDefaultKind.Kind, s.cfg)
-	if err != nil {
-		return false, Error.Wrap(err)
-	}
-	defer cons.Cancel()
+		cons, err := CreateTable(ctx, af.File, logSlots, today, s.cfg.TableDefaultKind.Kind, s.cfg)
+		if err != nil {
+			return false, Error.Wrap(err)
+		}
+		defer cons.Cancel()
 
-	// keep track of statistics about some events that can happen to records during the compaction.
-	var (
-		totalCtr     bytesCounter
-		rewrittenCtr bytesCounter
-		trashedCtr   bytesCounter
-		restoredCtr  bytesCounter
-		expiredCtr   bytesCounter
-		reclaimedCtr bytesCounter
+		// keep track of statistics about some events that can happen to records during the compaction.
+		var (
+			totalCtr     bytesCounter
+			rewrittenCtr bytesCounter
+			trashedCtr   bytesCounter
+			restoredCtr  bytesCounter
+			expiredCtr   bytesCounter
+			reclaimedCtr bytesCounter
 
-		// recDiskLength returns the length on disk of a record including the footer.
-		recDiskLength = func(rec Record) uint64 { return uint64(rec.Length) + RecordSize }
-	)
+			// recDiskLength returns the length on disk of a record including the footer.
+			recDiskLength = func(rec Record) uint64 { return uint64(rec.Length) + RecordSize }
+		)
 
-	// keep track of all of the rewritten records
-	ri := new(rewrittenIndex)
+		// keep track of all of the rewritten records
+		ri := new(rewrittenIndex)
 
-	// if we have any rewrite logs, then all of the records we will be rewriting when we create the
-	// next hashtbl so we can sort them and rewrite them early.
-	if len(rewrite) > 0 && s.cfg.Compaction.OrderedRewrite {
-		rewriteStart := time.Now()
+		// if we have any rewrite logs, then all of the records we will be rewriting when we create the
+		// next hashtbl so we can sort them and rewrite them early.
+		if len(rewrite) > 0 && s.cfg.Compaction.OrderedRewrite {
+			rewriteStart := time.Now()
 
+			if err := s.tbl.Range(ctx, func(ctx context.Context, rec Record) (bool, error) {
+				if err := ctx.Err(); err != nil {
+					return false, err
+				}
+
+				// we can rewrite records without breaking anything and rather than call into all the
+				// shouldTrash/restored callbacks multiple times, we'll just grab an approximation
+				// and if we rewrite too many, fine. and if we rewrite too few, we just have to do
+				// some double checks in the next loop over the table. this should still be the vast
+				// majority of rewrites, so we'll still get mostly linear writes.
+				if rewrite[rec.Log] && !expired(rec.Expires) {
+					ri.add(rec)
+				}
+
+				return true, nil
+			}); err != nil {
+				return false, err
+			}
+
+			// sort by log and offset so that we can rewrite them in disk order.
+			ri.sortByLogOff()
+
+			// update the total number of records expected to be rewritten in this compaction.
+			s.stats.totalRecords.Store(uint64(len(ri.records)))
+			s.stats.processedRecords.Store(0)
+
+			// rewrite each record and update the record in the index.
+			for i := range ri.records {
+				s.stats.processedRecords.Add(1) // bump the number of records processed for progress reporting.
+
+				if err := func() error {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+
+					rec, err := s.rewriteRecord(ctx, ri.records[i], rewriteCandidates)
+					if err != nil {
+						return Error.Wrap(err)
+					}
+					ri.records[i] = rec
+
+					s.stats.dataRewritten.Add(recDiskLength(rec))
+					rewrittenCtr.Add(recDiskLength(rec))
+
+					return nil
+				}(); err != nil {
+					return false, Error.Wrap(err)
+				}
+			}
+
+			// now sort by key so that we can efficiently look up if we rewrote them in the next loop.
+			ri.sortByKey()
+
+			// log about the time we took rewriting the records.
+			if ce := s.log.Check(zapcore.InfoLevel, "records rewritten"); ce != nil {
+				ce.Write(
+					zap.Uint64("records", rewrittenCtr.count),
+					 zapHumanBytes("bytes", rewrittenCtr.bytes),
+					 zap.Duration("duration", time.Since(rewriteStart)),
+				)
+			}
+
+		}
+
+		// update the values for progress reporting.
+		s.stats.writeTime.Store(time.Now())
+		s.stats.totalRecords.Store(nexist)
+		s.stats.processedRecords.Store(0)
+
+		// copy all of the entries from the hash table to the new table, skipping expired entries, and
+		// rewriting any entries that are in the log files that we are rewriting.
 		if err := s.tbl.Range(ctx, func(ctx context.Context, rec Record) (bool, error) {
 			if err := ctx.Err(); err != nil {
 				return false, err
 			}
+			s.stats.processedRecords.Add(1) // bump the number of records processed for progress reporting.
 
-			// we can rewrite records without breaking anything and rather than call into all the
-			// shouldTrash/restored callbacks multiple times, we'll just grab an approximation
-			// and if we rewrite too many, fine. and if we rewrite too few, we just have to do
-			// some double checks in the next loop over the table. this should still be the vast
-			// majority of rewrites, so we'll still get mostly linear writes.
-			if rewrite[rec.Log] && !expired(rec.Expires) {
-				ri.add(rec)
+			// trash records are flagged as expired some number of days from now with a bit set to
+			// signal if they are read that there was a problem. we only check records that are not
+			// already flagged as trashed and keep the minimum time for the record to live. we do this
+			// after compaction so that we don't mistakenly count it as a "revive".
+			if shouldTrash != nil && !rec.Expires.Trash() && shouldTrash(ctx, rec.Key, DateToTime(rec.Created)) {
+				expiresTime := today + uint32(s.cfg.Compaction.ExpiresDays)
+				// if we have an existing ttl time and it's smaller, use that instead.
+				if existingTime := rec.Expires.Time(); existingTime > 0 && existingTime < expiresTime {
+					expiresTime = existingTime
+				}
+				// only update the expired time if it won't immediately be restored. this ensures we
+				// dont clear out the ttl field for no reason right after this.
+				if exp := NewExpiration(expiresTime, true); !restored(exp) {
+					rec.Expires = exp
+
+					trashedCtr.Add(recDiskLength(rec))
+				}
 			}
+
+			// if the record is restored, clear the expiration. we do this after checking if the record
+			// should be trashed to ensure that restore always has precedence.
+			if restored(rec.Expires) {
+				rec.Expires = 0
+
+				// we bump created so that the shouldTrash callback likely ignores it in case the bloom
+				// filter was bad or something. this may change once the hashstore is more integrated
+				// with the system and it has more details about the bloom filter.
+				rec.Created = today
+
+				restoredCtr.Add(recDiskLength(rec))
+			}
+
+			// totally ignore any expired records.
+			if expired(rec.Expires) {
+				expiredCtr.Add(recDiskLength(rec))
+				return true, nil
+			}
+
+			// if the log is being rewritten, copy the record into the a different log file.
+			if rewrite[rec.Log] {
+				// if we already rewrote the record earlier, then update the record to be the new
+				// rewritten one. otherwise, we have to rewrite it now. note that the above code may
+				// have changed some fields, so we only want to update the log and offset fields. the
+				// earlier loop ensures that only the log and offset fields are different.
+				if i, ok := ri.findKey(rec.Key); ok && !test_Store_IgnoreRewrittenIndex {
+					rec.Log, rec.Offset = ri.records[i].Log, ri.records[i].Offset
+				} else {
+					rewrittenRec, err := s.rewriteRecord(ctx, rec, rewriteCandidates)
+					if err != nil {
+						return false, Error.Wrap(err)
+					}
+					rec = rewrittenRec
+
+					s.stats.dataRewritten.Add(recDiskLength(rec))
+					rewrittenCtr.Add(recDiskLength(rec))
+				}
+			}
+
+			// insert the record into the new hash table.
+			if ok, err := cons.Append(ctx, rec); err != nil {
+				return false, Error.Wrap(err)
+			} else if !ok {
+				return false, Error.New("compaction hash table is full")
+			}
+
+			totalCtr.Add(recDiskLength(rec))
 
 			return true, nil
 		}); err != nil {
 			return false, err
 		}
 
-		// sort by log and offset so that we can rewrite them in disk order.
-		ri.sortByLogOff()
+		// help out the compiler/runtime by explicitly clearing out the index now that it's not needed.
+		// it's possible the liveness analysis does this, but it's nice to not have to rely on that.
+		ri = nil
 
-		// update the total number of records expected to be rewritten in this compaction.
-		s.stats.totalRecords.Store(uint64(len(ri.records)))
-		s.stats.processedRecords.Store(0)
-
-		// rewrite each record and update the record in the index.
-		for i := range ri.records {
-			s.stats.processedRecords.Add(1) // bump the number of records processed for progress reporting.
-
-			if err := func() error {
-				if err := ctx.Err(); err != nil {
-					return err
-				}
-
-				rec, err := s.rewriteRecord(ctx, ri.records[i], rewriteCandidates)
-				if err != nil {
-					return Error.Wrap(err)
-				}
-				ri.records[i] = rec
-
-				s.stats.dataRewritten.Add(recDiskLength(rec))
-				rewrittenCtr.Add(recDiskLength(rec))
-
-				return nil
-			}(); err != nil {
-				return false, Error.Wrap(err)
-			}
+		ntbl, err := cons.Done(ctx)
+		if err != nil {
+			return false, Error.Wrap(err)
 		}
 
-		// now sort by key so that we can efficiently look up if we rewrote them in the next loop.
-		ri.sortByKey()
+		// commit the new hash table. there should be no error cases in this function after this point
+		// because a process restart may have the store open with this new hash table, so we have to go
+		// forward with it.
+		if err := af.Commit(); err != nil {
+			return false, Error.New("unable to commit newly compacted hashtbl: %w", err)
+		}
 
-		// log about the time we took rewriting the records.
-		if ce := s.log.Check(zapcore.InfoLevel, "records rewritten"); ce != nil {
+		// swap the new hash table in and collect the set of log files to remove. we don't close and
+		// remove the log files while holding the lock to avoid doing i/o while blocking readers.
+		s.rmu.Lock()
+		otbl := s.tbl
+		s.tbl = ntbl
+
+		toRemove := make([]*logFile, 0, len(rewrite))
+		for id := range rewrite {
+			if lf, ok := s.lfs.LoadAndDelete(id); ok {
+				toRemove = append(toRemove, lf)
+			}
+		}
+		s.rmu.Unlock()
+
+		// now that we are no longer holding the mutex, close and remove the old hashtbl and close and
+		// remove the newly dead log files. log files have protection to not actually close the
+		// underlying file handle until the last reader is finished. we have to strip the .tmp suffix on
+		// the hashtbl file name because the file handles were potentially created with .tmp before
+		// being renamed in place, which does not update their name.
+		_ = otbl.Close()
+		_ = os.Remove(strings.TrimSuffix(otbl.Handle().Name(), ".tmp"))
+
+		for _, lf := range toRemove {
+			// these errors are ok to ignore because the only error from close could be an error
+			// flushing data to disk but we're about to delete it because no records point into it.
+			_ = lf.Close()
+			_ = os.Remove(lf.path)
+
+			size := dead[lf.id]
+			s.stats.dataReclaimed.Add(size)
+
+			reclaimedCtr.Add(size)
+		}
+
+		// best effort sync the directories now that we are done with mutations.
+		syncDirectory(s.tablePath)
+		syncDirectory(s.logsPath)
+
+		// before we allow writers to proceed, reinitialize the heap with the log files so that it has
+		// the best set of logs to write into and doesn't contain any now closed/removed logs.
+		s.lfc.Clear()
+		_ = s.lfs.Range(func(_ uint64, lf *logFile) (bool, error) {
+			s.lfc.Include(lf)
+			return true, nil
+		})
+
+		// log information about important events that happened to records during the writing of the new
+		// hashtbl.
+		if ce := s.log.Check(zapcore.InfoLevel, "hashtbl rewritten"); ce != nil {
 			ce.Write(
-				zap.Uint64("records", rewrittenCtr.count),
-				zapHumanBytes("bytes", rewrittenCtr.bytes),
-				zap.Duration("duration", time.Since(rewriteStart)),
+				zap.Duration("duration", time.Since(s.stats.writeTime.Load().(time.Time))),
+				 zap.Uint64("total_records", totalCtr.count),
+				 zapHumanBytes("total_bytes", totalCtr.bytes),
+				 zap.Uint64("rewritten_records", rewrittenCtr.count),
+				 zapHumanBytes("rewritten_bytes", rewrittenCtr.bytes),
+				 zap.Uint64("trashed_records", trashedCtr.count),
+				 zapHumanBytes("trashed_bytes", trashedCtr.bytes),
+				 zap.Uint64("restored_records", restoredCtr.count),
+				 zapHumanBytes("restored_bytes", restoredCtr.bytes),
+				 zap.Uint64("expired_records", expiredCtr.count),
+				 zapHumanBytes("expired_bytes", expiredCtr.bytes),
+				 zap.Uint64("reclaimed_logs", reclaimedCtr.count),
+				 zapHumanBytes("reclaimed_bytes", reclaimedCtr.bytes),
+				 zap.Float64("reclaim_ratio", float64(reclaimedCtr.bytes)/float64(rewrittenCtr.bytes)),
 			)
 		}
 
-	}
+		// after a compaction has finished, everything is all sync'd and clean, so write out a new hint
+		// file for the next startup.
+		s.writeHintFile()
 
-	// update the values for progress reporting.
-	s.stats.writeTime.Store(time.Now())
-	s.stats.totalRecords.Store(nexist)
-	s.stats.processedRecords.Store(0)
-
-	// copy all of the entries from the hash table to the new table, skipping expired entries, and
-	// rewriting any entries that are in the log files that we are rewriting.
-	if err := s.tbl.Range(ctx, func(ctx context.Context, rec Record) (bool, error) {
-		if err := ctx.Err(); err != nil {
-			return false, err
-		}
-		s.stats.processedRecords.Add(1) // bump the number of records processed for progress reporting.
-
-		// trash records are flagged as expired some number of days from now with a bit set to
-		// signal if they are read that there was a problem. we only check records that are not
-		// already flagged as trashed and keep the minimum time for the record to live. we do this
-		// after compaction so that we don't mistakenly count it as a "revive".
-		if shouldTrash != nil && !rec.Expires.Trash() && shouldTrash(ctx, rec.Key, DateToTime(rec.Created)) {
-			expiresTime := today + uint32(s.cfg.Compaction.ExpiresDays)
-			// if we have an existing ttl time and it's smaller, use that instead.
-			if existingTime := rec.Expires.Time(); existingTime > 0 && existingTime < expiresTime {
-				expiresTime = existingTime
-			}
-			// only update the expired time if it won't immediately be restored. this ensures we
-			// dont clear out the ttl field for no reason right after this.
-			if exp := NewExpiration(expiresTime, true); !restored(exp) {
-				rec.Expires = exp
-
-				trashedCtr.Add(recDiskLength(rec))
-			}
-		}
-
-		// if the record is restored, clear the expiration. we do this after checking if the record
-		// should be trashed to ensure that restore always has precedence.
-		if restored(rec.Expires) {
-			rec.Expires = 0
-
-			// we bump created so that the shouldTrash callback likely ignores it in case the bloom
-			// filter was bad or something. this may change once the hashstore is more integrated
-			// with the system and it has more details about the bloom filter.
-			rec.Created = today
-
-			restoredCtr.Add(recDiskLength(rec))
-		}
-
-		// totally ignore any expired records.
-		if expired(rec.Expires) {
-			expiredCtr.Add(recDiskLength(rec))
-			return true, nil
-		}
-
-		// if the log is being rewritten, copy the record into the a different log file.
-		if rewrite[rec.Log] {
-			// if we already rewrote the record earlier, then update the record to be the new
-			// rewritten one. otherwise, we have to rewrite it now. note that the above code may
-			// have changed some fields, so we only want to update the log and offset fields. the
-			// earlier loop ensures that only the log and offset fields are different.
-			if i, ok := ri.findKey(rec.Key); ok && !test_Store_IgnoreRewrittenIndex {
-				rec.Log, rec.Offset = ri.records[i].Log, ri.records[i].Offset
-			} else {
-				rewrittenRec, err := s.rewriteRecord(ctx, rec, rewriteCandidates)
-				if err != nil {
-					return false, Error.Wrap(err)
-				}
-				rec = rewrittenRec
-
-				s.stats.dataRewritten.Add(recDiskLength(rec))
-				rewrittenCtr.Add(recDiskLength(rec))
-			}
-		}
-
-		// insert the record into the new hash table.
-		if ok, err := cons.Append(ctx, rec); err != nil {
-			return false, Error.Wrap(err)
-		} else if !ok {
-			return false, Error.New("compaction hash table is full")
-		}
-
-		totalCtr.Add(recDiskLength(rec))
-
-		return true, nil
-	}); err != nil {
-		return false, err
-	}
-
-	// help out the compiler/runtime by explicitly clearing out the index now that it's not needed.
-	// it's possible the liveness analysis does this, but it's nice to not have to rely on that.
-	ri = nil
-
-	ntbl, err := cons.Done(ctx)
-	if err != nil {
-		return false, Error.Wrap(err)
-	}
-
-	// commit the new hash table. there should be no error cases in this function after this point
-	// because a process restart may have the store open with this new hash table, so we have to go
-	// forward with it.
-	if err := af.Commit(); err != nil {
-		return false, Error.New("unable to commit newly compacted hashtbl: %w", err)
-	}
-
-	// swap the new hash table in and collect the set of log files to remove. we don't close and
-	// remove the log files while holding the lock to avoid doing i/o while blocking readers.
-	s.rmu.Lock()
-	otbl := s.tbl
-	s.tbl = ntbl
-
-	toRemove := make([]*logFile, 0, len(rewrite))
-	for id := range rewrite {
-		if lf, ok := s.lfs.LoadAndDelete(id); ok {
-			toRemove = append(toRemove, lf)
-		}
-	}
-	s.rmu.Unlock()
-
-	// now that we are no longer holding the mutex, close and remove the old hashtbl and close and
-	// remove the newly dead log files. log files have protection to not actually close the
-	// underlying file handle until the last reader is finished. we have to strip the .tmp suffix on
-	// the hashtbl file name because the file handles were potentially created with .tmp before
-	// being renamed in place, which does not update their name.
-	_ = otbl.Close()
-	_ = os.Remove(strings.TrimSuffix(otbl.Handle().Name(), ".tmp"))
-
-	for _, lf := range toRemove {
-		// these errors are ok to ignore because the only error from close could be an error
-		// flushing data to disk but we're about to delete it because no records point into it.
-		_ = lf.Close()
-		_ = os.Remove(lf.path)
-
-		size := dead[lf.id]
-		s.stats.dataReclaimed.Add(size)
-
-		reclaimedCtr.Add(size)
-	}
-
-	// best effort sync the directories now that we are done with mutations.
-	syncDirectory(s.tablePath)
-	syncDirectory(s.logsPath)
-
-	// before we allow writers to proceed, reinitialize the heap with the log files so that it has
-	// the best set of logs to write into and doesn't contain any now closed/removed logs.
-	s.lfc.Clear()
-	_ = s.lfs.Range(func(_ uint64, lf *logFile) (bool, error) {
-		s.lfc.Include(lf)
-		return true, nil
-	})
-
-	// log information about important events that happened to records during the writing of the new
-	// hashtbl.
-	if ce := s.log.Check(zapcore.InfoLevel, "hashtbl rewritten"); ce != nil {
-		ce.Write(
-			zap.Duration("duration", time.Since(s.stats.writeTime.Load().(time.Time))),
-			zap.Uint64("total_records", totalCtr.count),
-			zapHumanBytes("total_bytes", totalCtr.bytes),
-			zap.Uint64("rewritten_records", rewrittenCtr.count),
-			zapHumanBytes("rewritten_bytes", rewrittenCtr.bytes),
-			zap.Uint64("trashed_records", trashedCtr.count),
-			zapHumanBytes("trashed_bytes", trashedCtr.bytes),
-			zap.Uint64("restored_records", restoredCtr.count),
-			zapHumanBytes("restored_bytes", restoredCtr.bytes),
-			zap.Uint64("expired_records", expiredCtr.count),
-			zapHumanBytes("expired_bytes", expiredCtr.bytes),
-			zap.Uint64("reclaimed_logs", reclaimedCtr.count),
-			zapHumanBytes("reclaimed_bytes", reclaimedCtr.bytes),
-			zap.Float64("reclaim_ratio", float64(reclaimedCtr.bytes)/float64(rewrittenCtr.bytes)),
-		)
-	}
-
-	// after a compaction has finished, everything is all sync'd and clean, so write out a new hint
-	// file for the next startup.
-	s.writeHintFile()
-
-	// if we rewrote every log file that we could potentially rewrite, then we're done. len is
-	// sufficient here because rewrite is a subset of rewriteCandidates. also if our rewrite
-	// multiple is 0, then we're done because we unlinked all the fully dead log files already.
-	return len(rewriteCandidates) == len(rewrite) || s.cfg.Compaction.RewriteMultiple == 0, nil
+		// if we rewrote every log file that we could potentially rewrite, then we're done. len is
+		// sufficient here because rewrite is a subset of rewriteCandidates. also if our rewrite
+		// multiple is 0, then we're done because we unlinked all the fully dead log files already.
+		return len(rewriteCandidates) == len(rewrite) || s.cfg.Compaction.RewriteMultiple == 0, nil
 }
 
 func (s *Store) rewriteRecord(ctx context.Context, rec Record, rewriteCandidates map[uint64]bool) (_ Record, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	r, err := s.readerForRecord(ctx, rec)
+	// Get the original log file so we know the path
+	lf, ok := s.lfs.Lookup(rec.Log)
+	if !ok {
+		return rec, Error.New("record points to unknown log file rec=%v", rec)
+	}
+
+	// Use a dedicated file handle (not from LRU) so we can safely give it SEQUENTIAL hint
+	fh, err := platform.OpenFileReadOnly(lf.path)
 	if err != nil {
 		return rec, Error.Wrap(err)
 	}
-	defer r.Release() // same as r.Close() but no error to worry about.
+	defer fh.Close()
 
-	// WARNING! this is subtle, but what we do is take the file handle directly out of the reader,
-	// seek it to the appropriate place, and use an io.LimitReader so that the go stdlib using
-	// io.Copy will do copy_file_range if available avoiding the copy into userspace. it would be a
-	// problem if multiple concurrent readers or writers were using the file pos at the same time,
-	// but readerForRecord returns a distinct file handle every time.
+	// Sequential hint for the full log file during compaction rewrite (as you requested)
+	fd := int(fh.Fd())
+	if fd > 0 {
+		_ = unix.Fadvise(fd, 0, 0, unix.FADV_SEQUENTIAL)  // Whole file
+	}
+
+	// Create reader using our dedicated handle (same as before)
+	r := newLogReader(s, lf.path, fh, rec)
+
+	// WARNING! this is subtle, but what we do is take the file handle directly out of the reader...
 	var from io.Reader = r
 	if _, err := r.fh.Seek(int64(rec.Offset), io.SeekStart); err == nil {
 		from = r.fh // we use io.CopyN below so it will be limited by the length.
 	}
 
-	// acquire a log file to write the entry into. if we're rewriting that log file or the record is
-	// already in that log file, we have to pick a different one.
+	// acquire a log file to write the entry into...
 	var into *logFile
 	for into == nil || rewriteCandidates[into.id] || into.id == rec.Log {
 		into, err = s.acquireLogFile(rec.Expires.Time())
@@ -1376,7 +1404,7 @@ func (s *Store) rewriteRecord(ctx context.Context, rec Record, rewriteCandidates
 		defer s.lfc.Include(into) //nolint intentionally defer in the loop
 	}
 
-	// get the current offset so that we are sure we have the correct spot for the record.
+	// get the current offset...
 	offset, err := into.fh.Seek(0, io.SeekEnd)
 	if err != nil {
 		return rec, Error.Wrap(err)
@@ -1384,20 +1412,8 @@ func (s *Store) rewriteRecord(ctx context.Context, rec Record, rewriteCandidates
 
 	// copy the record data.
 	if _, err := io.CopyN(into.fh, from, int64(rec.Length)); err != nil {
-		// if we couldn't write the data, we should abort the write operation and attempt to reclaim
-		// space by truncating to the saved offset.
 		_ = into.fh.Truncate(offset)
-
-		statSize := int64(-1)
-		if fi, statErr := r.fh.Stat(); statErr == nil {
-			statSize = fi.Size()
-		}
-		return rec, Error.New("writing into compacted log (rec=%v) (from=%v) (size=%d): %w",
-			rec,
-			r.fh.Name(),
-			statSize,
-			err,
-		)
+		return rec, Error.New("writing into compacted log (rec=%v) (from=%v): %w", rec, fh.Name(), err)
 	}
 
 	// update the record location.
@@ -1409,14 +1425,11 @@ func (s *Store) rewriteRecord(ctx context.Context, rec Record, rewriteCandidates
 	rec.WriteTo(&buf)
 
 	if _, err := into.fh.Write(buf[:]); err != nil {
-		// if we can't add the record, we should abort the write operation and attempt to reclaim
-		// space by tuncating to the saved offset.
 		_ = into.fh.Truncate(offset)
 		return rec, Error.New("writing record into compacted log: %w", err)
 	}
 
-	// increase our in-memory estimate of the size of the log file for sorting. we use store to
-	// ensure that it maintains correctness if there were some errors in the past.
+	// increase our in-memory estimate...
 	into.size.Store(uint64(offset) + uint64(rec.Length) + uint64(len(buf)))
 
 	// if the size is over the max size, close the file handle.
@@ -1507,14 +1520,14 @@ func parseHintFile(path string) *hintExcluder {
 
 	for scanner := bufio.NewScanner(fh); scanner.Scan(); {
 		switch line := strings.TrimSpace(scanner.Text()); {
-		case strings.HasPrefix(line, "largest: "):
-			if largest, err := strconv.ParseUint(line[9:], 16, 64); err == nil {
-				h.largest = largest
-			}
-		case strings.HasPrefix(line, "writable: "):
-			if id, err := strconv.ParseUint(line[10:], 16, 64); err == nil {
-				h.writable[id] = true
-			}
+			case strings.HasPrefix(line, "largest: "):
+				if largest, err := strconv.ParseUint(line[9:], 16, 64); err == nil {
+					h.largest = largest
+				}
+			case strings.HasPrefix(line, "writable: "):
+				if id, err := strconv.ParseUint(line[10:], 16, 64); err == nil {
+					h.writable[id] = true
+				}
 		}
 	}
 
