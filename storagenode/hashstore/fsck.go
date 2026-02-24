@@ -8,6 +8,8 @@ import (
 	"github.com/zeebo/errs"
 
 	"storj.io/storj/storagenode/hashstore/platform"
+
+	"golang.org/x/sys/unix"
 )
 
 var (
@@ -26,40 +28,41 @@ func readRecordsFromLogFile(
 	ctx context.Context,
 	lf *logFile,
 	valid func(Key, []byte) bool,
-	cb func(Record) bool,
+			    cb func(Record) bool,
 ) (err error) {
 	var contents []byte
-
 	wr := wrapLogFile(lf)
 	defer func() { err = errs.Combine(err, wr.Close()) }()
+
+	// NEW: Add fadvise hint here to optimize for sequential reads (encourages larger readahead)
+	fd := int(lf.fh.Fd())  // Use the underlying file descriptor
+	if fd > 0 {
+		_ = unix.Fadvise(fd, 0, 0, unix.FADV_SEQUENTIAL)  // Whole file; ignore error as it's a hint
+	}
 
 	for offset := int64(lf.size.Load()) - RecordSize; offset >= 0; {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-
 		rec, ok, err := wr.Record(offset)
 		if err != nil {
 			return err
 		}
-
 		if !ok || rec.Log != lf.id || int64(rec.Offset)+int64(rec.Length) != offset {
 			if test_fsck_errorOnInvalidRecord {
 				return Error.New("invalid record in log file. rec:%v log:%q id:%d got:%d exp:%d",
-					rec,
-					lf.path,
-					lf.id,
-					int64(rec.Offset)+int64(rec.Length),
-					offset,
+						 rec,
+		     lf.path,
+		     lf.id,
+		     int64(rec.Offset)+int64(rec.Length),
+						 offset,
 				)
 			}
 			offset--
 			continue
 		}
-
 		// we could skip reading the contents if valid is nil but in practice valid will always be
 		// set.
-
 		if len(contents) < int(rec.Length) {
 			contents = make([]byte, rec.Length)
 		}
@@ -72,8 +75,12 @@ func readRecordsFromLogFile(
 				return nil
 			}
 		}
-
 		offset = int64(rec.Offset) - RecordSize
+	}
+
+	// optional: tell kernel we are done with these pages
+	if fd > 0 {
+		_ = unix.Fadvise(fd, 0, 0, unix.FADV_DONTNEED)
 	}
 
 	return nil
@@ -83,7 +90,6 @@ func readRecordsFromLogFile(
 // the newest records for each key. The valid function is used to filter which records are included.
 func recordTailFromLog(ctx context.Context, lf *logFile, valid func(Key, []byte) bool) (_ *RecordTail, err error) {
 	defer mon.Task()(&ctx)(&err)
-
 	rt, n := new(RecordTail), 0
 	if err := readRecordsFromLogFile(ctx, lf, valid, func(rec Record) bool {
 		rt.Push(rec)
